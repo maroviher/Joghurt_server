@@ -16,6 +16,8 @@
 #include <inttypes.h>
 
 #include "RCSwitch.h"
+#include <pthread.h>
+#include <poll.h>
 
 const int g_iTemperatureLowerLimit = 35000;
 const int g_iTemperatureUpperLimit = 39000;
@@ -24,6 +26,7 @@ const int g_iTemperatureDelta = 250;
 char* strSystemCode = "10010";
 int iUnitCode = 3;
 const char w1_path[] = "/sys/bus/w1/devices/28-02162563e0ee/w1_slave";
+int g_iTemper;
 
 enum enPowerStates
 {
@@ -36,6 +39,8 @@ enum enPowerStates g_enCurrentPowerState = OFF;
 int sockfd = -1;
 char* g_line = NULL;
 RCSwitch* pSwitch = NULL;
+unsigned short port;
+struct in_addr ip = { };
 
 int SetupListenSocket(struct in_addr* ip, unsigned short port,
 		unsigned short rcv_timeout, bool bVerbose) {
@@ -53,23 +58,14 @@ int SetupListenSocket(struct in_addr* ip, unsigned short port,
 			while ((-1 == (iTmp = listen(sockListen, 0))) && (EINTR == errno))
 				;
 			if (-1 != iTmp) {
-				fprintf(stderr,
-						"Waiting for a TCP connection on %s:%" SCNu16 "...",
+				fprintf(stderr, "Waiting for a TCP connection on %s:%" SCNu16 "...",
 						inet_ntoa(saddr.sin_addr), ntohs(saddr.sin_port));
 				struct sockaddr_in cli_addr;
 				socklen_t clilen = sizeof(cli_addr);
-				while ((-1
-						== (sfd = accept(sockListen,
-								(struct sockaddr *) &cli_addr, &clilen)))
+				while ((-1 == (sfd = accept(sockListen, (struct sockaddr *) &cli_addr, &clilen)))
 						&& (EINTR == errno))
 					;
 				if (sfd >= 0) {
-					struct timeval timeout;
-					timeout.tv_sec = rcv_timeout;
-					timeout.tv_usec = 0;
-					if (setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO,
-							(char *) &timeout, sizeof(timeout)) < 0)
-						fprintf(stderr, "setsockopt failed\n");
 					fprintf(stderr, "Client connected from %s:%"SCNu16"\n",
 							inet_ntoa(cli_addr.sin_addr),
 							ntohs(cli_addr.sin_port));
@@ -163,6 +159,11 @@ void TurnPowerOn(int iTemper)
 	}
 }
 
+void TurnPowerOff_inittial()
+{
+	pSwitch->switchOff(strSystemCode, iUnitCode);
+}
+
 void TurnPowerOff(int iTemper)
 {
 	if((OFF != g_enCurrentPowerState) || (iTemper > g_iTemperatureUpperLimit))
@@ -174,14 +175,52 @@ void TurnPowerOff(int iTemper)
 	}
 }
 
+void* thread_start(void *arg)
+{
+	while(1)
+	{
+		sockfd = SetupListenSocket(&ip, port, 3, false);
+		if (sockfd < 0) {
+			fprintf(stderr, "2\n");		
+			return NULL;
+        	}
+		int sendbuff = 8;
+		if(0 != setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sendbuff, sizeof(sendbuff)))
+			fprintf(stderr, "setsockopt failed, errno=%d\n", errno);
+		
+		while(1)
+		{
+			if (4 != send(sockfd, &g_iTemper, 4, MSG_NOSIGNAL)) {
+				close(sockfd);
+				fprintf(stderr, "send failed, errno=%d\n", errno);
+				break;
+			}
+
+			//the following waits 1000ms or for the connection is closed
+			pollfd pfd;
+			pfd.fd = sockfd;
+			pfd.events = POLLIN;
+			pfd.revents = 0;
+			if (poll(&pfd, 1, 1000) > 0) {
+				char buffer[32];
+				if (recv(pfd.fd, buffer, sizeof(buffer), MSG_PEEK | MSG_DONTWAIT) == 0) {
+					close(sockfd);
+					fprintf(stderr, "connection closed\n");
+					break;
+				}
+         		}
+		}
+	}
+}
+
 int main(int argc, char** argv)
 {
 	if (argc < 3)
 		show_usage_and_exit(argv);
 
 	bool bListen = false, bVerbose = false;
-	unsigned short port, recv_timeout = 3;
-	struct in_addr ip = { };
+	unsigned short recv_timeout = 3;
+
 	int opt;
 	while ((opt = getopt(argc, argv, "t:vlh:p:")) != -1) {
 		switch (opt) {
@@ -226,54 +265,22 @@ int main(int argc, char** argv)
         pSwitch->setPulseLength(300);
         pSwitch->enableTransmit(0);
 
-/*	if (wiringPiSetup() == -1)
-	{
-		fprintf(stderr, "wiringPiSetup failed\n");
-		return 1;
-	}
-	piHiPri(20);
-	RCSwitch mySwitch = RCSwitch();
-	mySwitch.setPulseLength(300);
-	mySwitch.enableTransmit(0);
-	char* strSystemCode = "10010";
-	int iUnitCode = 3;
-	mySwitch.switchOn(strSystemCode, iUnitCode);
-	mySwitch.switchOff(strSystemCode, iUnitCode);
-*/
 	g_line = (char*)malloc(200);
 	if (!g_line)
 		exit(EXIT_FAILURE);
 
+	pthread_t thread;
+	pthread_create(&thread, NULL, thread_start, NULL);
+	
+	TurnPowerOff_inittial();
 	while (1) {
-		if (bListen)
-			sockfd = SetupListenSocket(&ip, port, 3, bVerbose);
-		else
-			exit(1);
+		if(0 != ReadTemperatur(&g_iTemper))
+			g_iTemper = 12345678;//error, send unrealistic temperature, and turn off power
 
-		if (sockfd < 0) {
-			fprintf(stderr, "connect failed\n");
-			continue;
-		}
-
-		int iTemper;
-		char bGoRead = 1;
-		while (bGoRead) {
-
-			if(0 != ReadTemperatur(&iTemper))
-				iTemper = 12345678;//error, send unrealistic temperature, and turn off power
-
-			if(iTemper < g_iCentralTemperature - g_iTemperatureDelta )
-				TurnPowerOn(iTemper);
-			else if(iTemper > g_iTemperatureDelta + g_iCentralTemperature)
-				TurnPowerOff(iTemper);
-
-			if (4 != send(sockfd, &iTemper, 4, MSG_NOSIGNAL)) {
-				close(sockfd);
-				fprintf(stderr, "send failed, errno=%d\n", errno);
-				bGoRead = 0;
-			}
-			//sleep(1);
-		}
+		if(g_iTemper < g_iCentralTemperature - g_iTemperatureDelta )
+			TurnPowerOn(g_iTemper);
+		else if(g_iTemper > g_iTemperatureDelta + g_iCentralTemperature)
+			TurnPowerOff(g_iTemper);
 	}
 
 	return 0;
