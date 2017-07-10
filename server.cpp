@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 #include <stdbool.h>
 #include <inttypes.h>
@@ -26,7 +27,7 @@ const int g_iTemperatureDelta = 250;
 char* strSystemCode = "10010";
 int iUnitCode = 3;
 const char w1_path[] = "/sys/bus/w1/devices/28-02162563e0ee/w1_slave";
-int g_iTemper;
+int g_iTemper = 32;
 
 enum enPowerStates
 {
@@ -181,13 +182,14 @@ void* thread_start(void *arg)
 	{
 		sockfd = SetupListenSocket(&ip, port, 3, false);
 		if (sockfd < 0) {
-			fprintf(stderr, "2\n");		
+			fprintf(stderr, "Fatal error on SetupListenSocket\n");
 			return NULL;
-        	}
-		int sendbuff = 8;
+		}
+
+		int sendbuff = 12;
 		if(0 != setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sendbuff, sizeof(sendbuff)))
 			fprintf(stderr, "setsockopt failed, errno=%d\n", errno);
-		
+
 		while(1)
 		{
 			if (4 != send(sockfd, &g_iTemper, 4, MSG_NOSIGNAL)) {
@@ -208,7 +210,17 @@ void* thread_start(void *arg)
 					fprintf(stderr, "connection closed\n");
 					break;
 				}
-         		}
+				pfd.revents = 0;
+			}
+
+			unsigned long size;
+			if(0 ==	ioctl(sockfd, TIOCOUTQ, &size))
+			{
+				if(size > (unsigned long)sendbuff){
+					close(sockfd);
+					break;
+				}
+			}
 		}
 	}
 }
@@ -271,7 +283,7 @@ int main(int argc, char** argv)
 
 	pthread_t thread;
 	pthread_create(&thread, NULL, thread_start, NULL);
-	
+
 	TurnPowerOff_inittial();
 	while (1) {
 		if(0 != ReadTemperatur(&g_iTemper))
