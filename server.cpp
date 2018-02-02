@@ -20,9 +20,15 @@
 #include <pthread.h>
 #include <poll.h>
 
+#include <chrono>
+#include <sstream>
+#include <thread>
+#include <mutex>
+using namespace std;
+
 const int g_iTemperatureLowerLimit = 35000;
 const int g_iTemperatureUpperLimit = 39000;
-const int g_iCentralTemperature = 37000;
+const int g_iCentralTemperature = 36600;
 const int g_iTemperatureDelta = 250;
 char* strSystemCode = "10010";
 int iUnitCode = 3;
@@ -42,6 +48,11 @@ char* g_line = NULL;
 RCSwitch* pSwitch = NULL;
 unsigned short port;
 struct in_addr ip = { };
+
+//statistics
+chrono::system_clock::time_point time_start, time_last_poweron;
+long poweron_duration_sec = 0, cntOn=0, cntOff=0;
+std::mutex g_mux_stat;
 
 int SetupListenSocket(struct in_addr* ip, unsigned short port,
 		unsigned short rcv_timeout, bool bVerbose) {
@@ -67,7 +78,7 @@ int SetupListenSocket(struct in_addr* ip, unsigned short port,
 						&& (EINTR == errno))
 					;
 				if (sfd >= 0) {
-					fprintf(stderr, "Client connected from %s:%"SCNu16"\n",
+					fprintf(stderr, "Client connected from %s:%" SCNu16 "\n",
 							inet_ntoa(cli_addr.sin_addr),
 							ntohs(cli_addr.sin_port));
 				} else
@@ -102,6 +113,32 @@ void show_usage_and_exit(char** argv) {
 	fprintf(stderr, "Usage: wait for incoming connection: %s -l -p 1234\n", bname);
 	exit(EXIT_FAILURE);
 }
+/*
+int ReadTemperatur(int* pTemperatur) {
+
+	FILE* fp = fopen("/tmp/w1_path", "r");
+	if (fp == NULL) {
+		fprintf(stderr, "error %d opening file %s\n", errno, "/tmp/w1_path");
+		return -1;
+	}
+
+	size_t len = 0;
+	ssize_t read;
+	char* _buf = (char*)malloc(123);
+	if (-1 == (read = ::getline((char**)&_buf, &len, fp))) {//read the first line
+		fprintf(stderr, "getline error, line %d\n", __LINE__);
+		return -1;
+	}
+
+	if (1 != sscanf(_buf, "%d", pTemperatur)) {
+		fprintf(stderr, "sscanf error, line %d, buf=%s\n", __LINE__, _buf);
+		return -1;
+	}
+	free(_buf);
+	if(fp)
+		fclose(fp);
+	return 0;
+}*/
 
 int ReadTemperatur(int* pTemperatur) {
 	//the file looks like this
@@ -151,8 +188,12 @@ _error:
 
 void TurnPowerOn(int iTemper)
 {
-	if((ON != g_enCurrentPowerState) || (iTemper < g_iTemperatureLowerLimit))
+	std::lock_guard<std::mutex> lock(g_mux_stat);
+	if((ON != g_enCurrentPowerState)/* || (iTemper < g_iTemperatureLowerLimit)*/)
 	{
+		cntOn++;
+		time_last_poweron = chrono::system_clock::now();
+
 		for(int i=0; i<3; i++)
 			pSwitch->switchOn(strSystemCode, iUnitCode);
 		//system("for i in $(echo \"1\n2\n3\"); do /home/pi/raspberry-remote/send 10010 3 1; done");
@@ -167,13 +208,39 @@ void TurnPowerOff_inittial()
 
 void TurnPowerOff(int iTemper)
 {
-	if((OFF != g_enCurrentPowerState) || (iTemper > g_iTemperatureUpperLimit))
+	std::lock_guard<std::mutex> lock(g_mux_stat);
+	if((OFF != g_enCurrentPowerState)/* || (iTemper > g_iTemperatureUpperLimit)*/)
 	{
+		cntOff++;
+		long last_poweron_duration_sec = chrono::duration_cast<chrono::seconds>(
+				chrono::system_clock::now() - time_last_poweron).count();
+		poweron_duration_sec += last_poweron_duration_sec;
+
 		for(int i=0; i<3; i++)
 			pSwitch->switchOff(strSystemCode, iUnitCode);
 		//system("for i in $(echo \"1\n2\n3\"); do /home/pi/raspberry-remote/send 10010 3 0; done");
 		g_enCurrentPowerState = OFF;
 	}
+}
+
+void GetStatistics(string& strStat)
+{
+	std::lock_guard<std::mutex> lock(g_mux_stat);
+	time_t tt_start = chrono::system_clock::to_time_t(time_start);
+	time_t tt_now   = chrono::system_clock::to_time_t(chrono::system_clock::now());
+	long l_power_on = poweron_duration_sec;
+	if(ON == g_enCurrentPowerState)
+	{
+		l_power_on += chrono::duration_cast<chrono::seconds>(
+						chrono::system_clock::now() - time_last_poweron).count();
+	}
+	stringstream ss;
+	ss<<"started: " << ctime(&tt_start) <<
+			"current temperature=" << g_iTemper <<
+			"\npower cycles: on=" << cntOn << ", off=" << cntOff <<
+	    "\npoweron sec=" << l_power_on <<
+	    "\nnow:     "<< ctime(&tt_now)<<"\n";
+	strStat = ss.str().c_str();
 }
 
 void* thread_start(void *arg)
@@ -192,7 +259,9 @@ void* thread_start(void *arg)
 
 		while(1)
 		{
-			if (4 != send(sockfd, &g_iTemper, 4, MSG_NOSIGNAL)) {
+			string strStat;
+			GetStatistics(strStat);
+			if (strStat.length() != send(sockfd, strStat.c_str(), strStat.length(), MSG_NOSIGNAL)) {
 				close(sockfd);
 				fprintf(stderr, "send failed, errno=%d\n", errno);
 				break;
@@ -268,14 +337,14 @@ int main(int argc, char** argv)
 	}
 
 	if (wiringPiSetup() == -1)
-        {
-                fprintf(stderr, "wiringPiSetup failed\n");
-                return 1;
-        }
+	{
+		fprintf(stderr, "wiringPiSetup failed\n");
+			return 1;
+	}
 	piHiPri(20);
-        pSwitch = new RCSwitch();
-        pSwitch->setPulseLength(300);
-        pSwitch->enableTransmit(0);
+	pSwitch = new RCSwitch();
+	pSwitch->setPulseLength(300);
+	pSwitch->enableTransmit(0);
 
 	g_line = (char*)malloc(200);
 	if (!g_line)
@@ -285,6 +354,7 @@ int main(int argc, char** argv)
 	pthread_create(&thread, NULL, thread_start, NULL);
 
 	TurnPowerOff_inittial();
+	time_start = chrono::system_clock::now();
 	while (1) {
 		if(0 != ReadTemperatur(&g_iTemper))
 			g_iTemper = 12345678;//error, send unrealistic temperature, and turn off power
